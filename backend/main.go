@@ -5,12 +5,13 @@
 // Prerequisites:
 //   1. Go installed (https://go.dev/dl/)
 //   2. MySQL 8.x installed and running
-//   3. Run schema.sql in MySQL first
+//   3. Run db/schema.sql in MySQL first
 //
 // Setup:
 //   go mod init weekly-watch
 //   go get github.com/go-sql-driver/mysql
-//   go run main.go
+//   From repo root: go run ./backend
+//   Or from backend/: go run .
 //
 // Then open http://localhost:8080 in your browser.
 // =============================================================
@@ -24,6 +25,8 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -42,6 +45,7 @@ const (
 )
 
 var db *sql.DB
+var indexTemplate *template.Template
 
 // ==========================
 // Data Models
@@ -124,6 +128,28 @@ func connectDB() error {
 	}
 
 	return nil
+}
+
+func loadIndexTemplate() error {
+	candidates := []string{
+		filepath.Join("frontend", "index.html"),
+		filepath.Join("..", "frontend", "index.html"),
+	}
+	var lastErr error
+	for _, p := range candidates {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		t, err := template.New("index").Parse(string(b))
+		if err != nil {
+			return fmt.Errorf("parse template %s: %w", p, err)
+		}
+		indexTemplate = t
+		return nil
+	}
+	return fmt.Errorf("load frontend/index.html: tried %v: %w", candidates, lastErr)
 }
 
 // ==========================
@@ -306,12 +332,13 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tmpl, err := template.New("index").Parse(indexHTML)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+	if indexTemplate == nil {
+		http.Error(w, "index template not loaded", http.StatusInternalServerError)
 		return
 	}
-	tmpl.Execute(w, data)
+	if err := indexTemplate.Execute(w, data); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
@@ -336,222 +363,6 @@ func apiStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ==========================
-// HTML Template
-// ==========================
-
-const indexHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The Weekly Watch</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0f0f0f; color: #e0e0e0; min-height: 100vh;
-        }
-        .header {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            padding: 24px 40px; border-bottom: 2px solid #e94560;
-            display: flex; justify-content: space-between; align-items: center;
-        }
-        .header h1 { color: #e94560; font-size: 28px; letter-spacing: 1px; }
-        .connection-badge {
-            background: #1b4332; color: #95d5b2; padding: 8px 16px;
-            border-radius: 20px; font-size: 13px; font-weight: 600;
-        }
-        .connection-badge.error { background: #4a1520; color: #f4978e; }
-        .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
-
-        .db-info {
-            background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 8px;
-            padding: 16px 24px; margin-bottom: 32px; font-size: 14px; color: #8888aa;
-        }
-        .db-info strong { color: #e94560; }
-
-        .section { margin-bottom: 40px; }
-        .section h2 {
-            color: #e94560; font-size: 20px; margin-bottom: 16px;
-            padding-bottom: 8px; border-bottom: 1px solid #2a2a4a;
-        }
-
-        table {
-            width: 100%; border-collapse: collapse; background: #1a1a2e;
-            border-radius: 8px; overflow: hidden;
-        }
-        th {
-            background: #16213e; color: #e94560; padding: 12px 16px;
-            text-align: left; font-size: 13px; text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-        td { padding: 10px 16px; border-bottom: 1px solid #2a2a4a; font-size: 14px; }
-        tr:hover td { background: #1f1f3a; }
-
-        .user-select {
-            display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 24px;
-        }
-        .user-btn {
-            background: #1a1a2e; color: #c0c0d0; border: 1px solid #3a3a5a;
-            padding: 8px 18px; border-radius: 6px; cursor: pointer;
-            text-decoration: none; font-size: 14px; transition: all 0.2s;
-        }
-        .user-btn:hover { border-color: #e94560; color: #e94560; }
-        .user-btn.active { background: #e94560; color: white; border-color: #e94560; }
-
-        .status-badge {
-            display: inline-block; padding: 3px 10px; border-radius: 12px;
-            font-size: 12px; font-weight: 600;
-        }
-        .status-completed { background: #1b4332; color: #95d5b2; }
-        .status-pending { background: #3d2e00; color: #ffd166; }
-        .status-loved { background: #4a1520; color: #f4978e; }
-        .status-liked { background: #1b4332; color: #95d5b2; }
-        .status-disliked { background: #2a2a4a; color: #8888aa; }
-
-        .empty-state {
-            text-align: center; padding: 32px; color: #555;
-            font-style: italic;
-        }
-
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-        @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>The Weekly Watch</h1>
-        {{if .Connected}}
-            <span class="connection-badge">Connected to MySQL</span>
-        {{else}}
-            <span class="connection-badge error">Disconnected</span>
-        {{end}}
-    </div>
-
-    <div class="container">
-        {{if .Error}}
-            <div class="db-info" style="border-color: #e94560;">
-                <strong>Error:</strong> {{.Error}}
-            </div>
-        {{end}}
-
-        <div class="db-info">
-            <strong>DBMS:</strong> {{.DBInfo}} &nbsp;|&nbsp;
-            <strong>Language:</strong> Go (Golang) &nbsp;|&nbsp;
-            <strong>Driver:</strong> go-sql-driver/mysql &nbsp;|&nbsp;
-            <strong>Status:</strong> Successfully Connected
-        </div>
-
-        <!-- USER SELECTOR -->
-        <div class="section">
-            <h2>Select a User</h2>
-            <div class="user-select">
-                {{range .Users}}
-                    <a class="user-btn {{if $.SelectedUser}}{{if eq $.SelectedUser.UserID .UserID}}active{{end}}{{end}}"
-                       href="/?user_id={{.UserID}}">
-                        {{.Username}}
-                    </a>
-                {{end}}
-            </div>
-        </div>
-
-        {{if .SelectedUser}}
-        <!-- USER DASHBOARD -->
-        <div class="section">
-            <h2>Dashboard: {{.SelectedUser.Username}}</h2>
-
-            <div class="grid-2">
-                <!-- Viewing History -->
-                <div>
-                    <h2 style="font-size: 16px;">Viewing History</h2>
-                    {{if .ViewingHistory}}
-                    <table>
-                        <tr><th>Movie</th><th>Watched</th><th>Count</th><th>Status</th></tr>
-                        {{range .ViewingHistory}}
-                        <tr>
-                            <td>{{.MovieTitle}}</td>
-                            <td>{{.WatchedDate}}</td>
-                            <td>{{.WatchCount}}</td>
-                            <td><span class="status-badge status-{{.CompletionStatus}}">{{.CompletionStatus}}</span></td>
-                        </tr>
-                        {{end}}
-                    </table>
-                    {{else}}<p class="empty-state">No viewing history yet.</p>{{end}}
-                </div>
-
-                <!-- Ratings -->
-                <div>
-                    <h2 style="font-size: 16px;">Ratings</h2>
-                    {{if .Ratings}}
-                    <table>
-                        <tr><th>Movie</th><th>Rating</th><th>Date</th></tr>
-                        {{range .Ratings}}
-                        <tr>
-                            <td>{{.MovieTitle}}</td>
-                            <td><span class="status-badge status-{{.RatingValue}}">{{.RatingValue}}</span></td>
-                            <td>{{.RatedAt}}</td>
-                        </tr>
-                        {{end}}
-                    </table>
-                    {{else}}<p class="empty-state">No ratings yet.</p>{{end}}
-                </div>
-            </div>
-        </div>
-
-        <!-- Weekly Recommendations -->
-        <div class="section">
-            <h2>Weekly Recommendations</h2>
-            {{if .Recommendations}}
-            <table>
-                <tr><th>Movie</th><th>Assigned</th><th>Due</th><th>Status</th></tr>
-                {{range .Recommendations}}
-                <tr>
-                    <td>{{.MovieTitle}}</td>
-                    <td>{{.AssignedDate}}</td>
-                    <td>{{.DueDate}}</td>
-                    <td><span class="status-badge status-{{.Status}}">{{.Status}}</span></td>
-                </tr>
-                {{end}}
-            </table>
-            {{else}}<p class="empty-state">No recommendations yet.</p>{{end}}
-        </div>
-        {{end}}
-
-        <!-- ALL MOVIES -->
-        <div class="section">
-            <h2>Movie Catalog</h2>
-            <table>
-                <tr><th>Title</th><th>Genres</th><th>TMDB ID</th></tr>
-                {{range .Movies}}
-                <tr>
-                    <td><strong>{{.Title}}</strong></td>
-                    <td>{{.Genres}}</td>
-                    <td>{{.TmdbID}}</td>
-                </tr>
-                {{end}}
-            </table>
-        </div>
-
-        <!-- ALL USERS -->
-        <div class="section">
-            <h2>Registered Users</h2>
-            <table>
-                <tr><th>ID</th><th>Username</th><th>Email</th><th>Joined</th></tr>
-                {{range .Users}}
-                <tr>
-                    <td>{{.UserID}}</td>
-                    <td>{{.Username}}</td>
-                    <td>{{.Email}}</td>
-                    <td>{{.CreatedAt}}</td>
-                </tr>
-                {{end}}
-            </table>
-        </div>
-    </div>
-</body>
-</html>`
-
-// ==========================
 // Main
 // ==========================
 
@@ -568,6 +379,10 @@ func main() {
 		log.Fatalf("Database connection failed: %v\n", err)
 	}
 	defer db.Close()
+
+	if err := loadIndexTemplate(); err != nil {
+		log.Fatalf("Template load failed: %v\n", err)
+	}
 
 	fmt.Println("Successfully connected to MySQL!")
 	fmt.Println()

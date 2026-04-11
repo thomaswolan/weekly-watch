@@ -41,7 +41,7 @@ go version
 mysql -u root -p
 
 # Inside MySQL, run the schema file:
-source /path/to/schema.sql;
+source /path/to/db/schema.sql;
 
 # Verify tables were created:
 USE weekly_watch;
@@ -53,7 +53,7 @@ SELECT * FROM Movie;
 ```
 
 ### Step 2: Configure the Go App
-Open `main.go` and update the database credentials at the top:
+Open `backend/main.go` and update the database credentials at the top:
 ```go
 const (
     dbUser = "root"        // Your MySQL username
@@ -66,13 +66,23 @@ const (
 
 ### Step 3: Install Go Dependencies
 ```bash
-cd /path/to/project
+cd /path/to/project/backend
 go mod tidy
 ```
 
 ### Step 4: Run the Application
+From the repository root (recommended, so the app finds `frontend/index.html`):
+
 ```bash
-go run main.go
+cd /path/to/project
+go run ./backend
+```
+
+Or from `backend/`:
+
+```bash
+cd /path/to/project/backend
+go run .
 ```
 
 You should see:
@@ -115,7 +125,7 @@ Navigate to **http://localhost:8080** in your browser.
 
 ## Deliverable Screenshots Checklist
 
-1. **Normalized Schema** — Use the schema.sql file or screenshot of tables in MySQL Workbench
+1. **Normalized Schema** — Use `db/schema.sql` or a screenshot of tables in MySQL Workbench
 2. **Tables with Sample Data** — Screenshot the tables in MySQL Workbench showing 5+ rows each
 3. **DBMS-Interface Connection** — Screenshot the running Go app in terminal + the web page showing "Connected to MySQL"
 
@@ -124,10 +134,18 @@ Navigate to **http://localhost:8080** in your browser.
 ## Project Structure
 ```
 weekly-watch/
-├── schema.sql    # Complete MySQL schema + sample data
-├── main.go       # Go web application
-├── go.mod        # Go module definition
-└── README.md     # This file
+├── README.md
+├── docs/              # Project documentation (placeholders for now)
+├── db/
+│   └── schema.sql     # MySQL schema + sample data
+├── backend/
+│   ├── main.go        # Go web server and DB access
+│   ├── go.mod
+│   └── go.sum
+├── frontend/
+│   └── index.html     # Go html/template for the main page
+├── reports/           # Generated or exported reports
+└── roles/             # Role-related assets or notes (optional)
 ```
 
 ---
