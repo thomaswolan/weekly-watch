@@ -17,6 +17,8 @@ CREATE TABLE User (
     user_id       INT           PRIMARY KEY AUTO_INCREMENT,
     username      VARCHAR(50)   NOT NULL UNIQUE,
     email         VARCHAR(100)  NOT NULL UNIQUE,
+    password_hash VARCHAR(255)  NOT NULL DEFAULT '',
+    is_admin      BOOLEAN       NOT NULL DEFAULT FALSE,
     created_at    DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_login    DATETIME      DEFAULT NULL
 );
@@ -204,6 +206,12 @@ INSERT INTO User (username, email) VALUES
 ('mason_d',     'mason@example.com'),
 ('isabella_f',  'isabella@example.com'),
 ('ethan_z',     'ethan@example.com');
+
+-- Set default password for all seed users (password: "password123")
+UPDATE User SET password_hash = '$2a$10$Z5gnmK/KtsUuE8ZEp/SbV.5QU/7DAd3Cl0VSjIseRj.M18iYTsCk.';
+
+-- Make tom_w an admin
+UPDATE User SET is_admin = TRUE WHERE username = 'tom_w';
 
 -- Movies (22 rows)
 INSERT INTO Movie (title, plot_summary, trailer_url, tmdb_id) VALUES

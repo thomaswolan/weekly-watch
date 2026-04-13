@@ -29,6 +29,8 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/gorilla/sessions"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // ==========================
@@ -44,17 +46,29 @@ const (
 )
 
 var db *sql.DB
+var store = sessions.NewCookieStore([]byte("weekly-watch-secret-key-cs4604"))
+
+func init() {
+	store.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   86400 * 7,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+}
 
 // ==========================
 // Data Models
 // ==========================
 
 type User struct {
-	UserID    int
-	Username  string
-	Email     string
-	CreatedAt string
-	LastLogin sql.NullString
+	UserID       int
+	Username     string
+	Email        string
+	PasswordHash string
+	IsAdmin      bool
+	CreatedAt    string
+	LastLogin    sql.NullString
 }
 
 type Movie struct {
@@ -111,6 +125,21 @@ type FlashMessage struct {
 	Message string
 }
 
+type PopularMovie struct {
+	Title       string
+	RatingCount int
+	LovedCount  int
+	LikedCount  int
+}
+
+type UserActivity struct {
+	Username       string
+	WatchCount     int
+	TotalRewatches int
+	ReviewCount    int
+	RatingCount    int
+}
+
 type PageData struct {
 	Users           []User
 	Movies          []Movie
@@ -125,6 +154,10 @@ type PageData struct {
 	Error           string
 	Flash           *FlashMessage
 	ActiveTab       string
+	LoggedInUser    *User
+	IsAdmin         bool
+	PopularMovies   []PopularMovie
+	UserActivities  []UserActivity
 }
 
 // ==========================
@@ -154,11 +187,63 @@ func connectDB() error {
 }
 
 // ==========================
+// Auth Helpers
+// ==========================
+
+func getCurrentUser(r *http.Request) *User {
+	session, err := store.Get(r, "weekly-watch-session")
+	if err != nil {
+		return nil
+	}
+	userID, ok := session.Values["user_id"].(int)
+	if !ok || userID == 0 {
+		return nil
+	}
+
+	var u User
+	var createdAt time.Time
+	err = db.QueryRow(
+		"SELECT user_id, username, email, password_hash, is_admin, created_at, last_login FROM User WHERE user_id = ?",
+		userID,
+	).Scan(&u.UserID, &u.Username, &u.Email, &u.PasswordHash, &u.IsAdmin, &createdAt, &u.LastLogin)
+	if err != nil {
+		return nil
+	}
+	u.CreatedAt = createdAt.Format("Jan 2, 2006")
+	return &u
+}
+
+func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if getCurrentUser(r) == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := getCurrentUser(r)
+		if user == nil {
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		if !user.IsAdmin {
+			http.Redirect(w, r, "/?msg=Admin+access+required&msg_type=error", http.StatusSeeOther)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// ==========================
 // Query Functions
 // ==========================
 
 func getUsers() ([]User, error) {
-	rows, err := db.Query("SELECT user_id, username, email, created_at, last_login FROM User ORDER BY user_id")
+	rows, err := db.Query("SELECT user_id, username, email, password_hash, is_admin, created_at, last_login FROM User ORDER BY user_id")
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +253,7 @@ func getUsers() ([]User, error) {
 	for rows.Next() {
 		var u User
 		var createdAt time.Time
-		err := rows.Scan(&u.UserID, &u.Username, &u.Email, &createdAt, &u.LastLogin)
+		err := rows.Scan(&u.UserID, &u.Username, &u.Email, &u.PasswordHash, &u.IsAdmin, &createdAt, &u.LastLogin)
 		if err != nil {
 			return nil, err
 		}
@@ -344,6 +429,84 @@ func getUserReviews(userID int) ([]Review, error) {
 }
 
 // ==========================
+// Report Queries
+// ==========================
+
+func getPopularMovies() ([]PopularMovie, error) {
+	query := `
+		SELECT m.title,
+			COUNT(r.rating_id) AS rating_count,
+			SUM(CASE WHEN r.rating_value = 'loved' THEN 1 ELSE 0 END) AS loved_count,
+			SUM(CASE WHEN r.rating_value = 'liked' THEN 1 ELSE 0 END) AS liked_count
+		FROM Movie m
+		JOIN Rating r ON m.movie_id = r.movie_id
+		GROUP BY m.movie_id, m.title
+		ORDER BY rating_count DESC, loved_count DESC
+		LIMIT 15
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []PopularMovie
+	for rows.Next() {
+		var pm PopularMovie
+		err := rows.Scan(&pm.Title, &pm.RatingCount, &pm.LovedCount, &pm.LikedCount)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, pm)
+	}
+	return results, nil
+}
+
+func getUserActivitySummary() ([]UserActivity, error) {
+	query := `
+		SELECT u.username,
+			COALESCE(vh.watch_count, 0) AS watch_count,
+			COALESCE(vh.total_rewatches, 0) AS total_rewatches,
+			COALESCE(rev.review_count, 0) AS review_count,
+			COALESCE(rat.rating_count, 0) AS rating_count
+		FROM User u
+		LEFT JOIN (
+			SELECT user_id, COUNT(*) AS watch_count, SUM(watch_count) AS total_rewatches
+			FROM Viewing_History
+			GROUP BY user_id
+		) vh ON u.user_id = vh.user_id
+		LEFT JOIN (
+			SELECT user_id, COUNT(*) AS review_count
+			FROM Review
+			GROUP BY user_id
+		) rev ON u.user_id = rev.user_id
+		LEFT JOIN (
+			SELECT user_id, COUNT(*) AS rating_count
+			FROM Rating
+			GROUP BY user_id
+		) rat ON u.user_id = rat.user_id
+		ORDER BY watch_count DESC, rating_count DESC
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []UserActivity
+	for rows.Next() {
+		var ua UserActivity
+		err := rows.Scan(&ua.Username, &ua.WatchCount, &ua.TotalRewatches,
+			&ua.ReviewCount, &ua.RatingCount)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, ua)
+	}
+	return results, nil
+}
+
+// ==========================
 // HTTP Handlers
 // ==========================
 
@@ -353,10 +516,18 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	loggedInUser := getCurrentUser(r)
+	if loggedInUser == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
 	data := PageData{
-		Connected: true,
-		DBInfo:    fmt.Sprintf("MySQL 8.x @ %s:%s / %s", dbHost, dbPort, dbName),
-		ActiveTab: r.URL.Query().Get("tab"),
+		Connected:    true,
+		DBInfo:       fmt.Sprintf("MySQL 8.x @ %s:%s / %s", dbHost, dbPort, dbName),
+		ActiveTab:    r.URL.Query().Get("tab"),
+		LoggedInUser: loggedInUser,
+		IsAdmin:      loggedInUser.IsAdmin,
 	}
 	if data.ActiveTab == "" {
 		data.ActiveTab = "dashboard"
@@ -371,11 +542,14 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		data.Flash = &FlashMessage{Type: msgType, Message: msg}
 	}
 
-	users, err := getUsers()
-	if err != nil {
-		data.Error = "Error fetching users: " + err.Error()
+	// Admins get the full user list for user selector and manage tab
+	if loggedInUser.IsAdmin {
+		users, err := getUsers()
+		if err != nil {
+			data.Error = "Error fetching users: " + err.Error()
+		}
+		data.Users = users
 	}
-	data.Users = users
 
 	movies, err := getMovies()
 	if err != nil {
@@ -389,26 +563,44 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	data.Genres = genres
 
-	// Check if a user is selected
-	userIDStr := r.URL.Query().Get("user_id")
-	if userIDStr != "" {
-		var userID int
-		fmt.Sscanf(userIDStr, "%d", &userID)
-		for i, u := range users {
-			if u.UserID == userID {
-				data.SelectedUser = &users[i]
-				break
+	// Determine which user's dashboard to show
+	// Admins can select any user; regular users always see their own
+	selectedUserID := loggedInUser.UserID
+	if loggedInUser.IsAdmin {
+		if uidStr := r.URL.Query().Get("user_id"); uidStr != "" {
+			if uid, err := strconv.Atoi(uidStr); err == nil && uid > 0 {
+				selectedUserID = uid
 			}
-		}
-		if data.SelectedUser != nil {
-			data.ViewingHistory, _ = getUserViewingHistory(userID)
-			data.Recommendations, _ = getUserRecommendations(userID)
-			data.Ratings, _ = getUserRatings(userID)
-			data.Reviews, _ = getUserReviews(userID)
 		}
 	}
 
-	tmpl, err := template.New("index").Parse(indexHTML)
+	if loggedInUser.IsAdmin && len(data.Users) > 0 {
+		for i, u := range data.Users {
+			if u.UserID == selectedUserID {
+				data.SelectedUser = &data.Users[i]
+				break
+			}
+		}
+	} else {
+		data.SelectedUser = loggedInUser
+	}
+
+	if data.SelectedUser != nil {
+		data.ViewingHistory, _ = getUserViewingHistory(data.SelectedUser.UserID)
+		data.Recommendations, _ = getUserRecommendations(data.SelectedUser.UserID)
+		data.Ratings, _ = getUserRatings(data.SelectedUser.UserID)
+		data.Reviews, _ = getUserReviews(data.SelectedUser.UserID)
+	}
+
+	// Load reports data when on reports tab
+	if data.ActiveTab == "reports" {
+		data.PopularMovies, _ = getPopularMovies()
+		data.UserActivities, _ = getUserActivitySummary()
+	}
+
+	tmpl, err := template.New("index").Funcs(template.FuncMap{
+		"add": func(a, b int) int { return a + b },
+	}).Parse(indexHTML)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -490,13 +682,20 @@ func insertUserHandler(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
 	username := strings.TrimSpace(r.FormValue("username"))
 	email := strings.TrimSpace(r.FormValue("email"))
+	password := r.FormValue("password")
 
-	if username == "" || email == "" {
-		http.Redirect(w, r, "/?tab=manage&msg=Username+and+email+are+required&msg_type=error", http.StatusSeeOther)
+	if username == "" || email == "" || password == "" {
+		http.Redirect(w, r, "/?tab=manage&msg=Username,+email,+and+password+are+required&msg_type=error", http.StatusSeeOther)
+		return
+	}
+	if len(password) < 6 {
+		http.Redirect(w, r, "/?tab=manage&msg=Password+must+be+at+least+6+characters&msg_type=error", http.StatusSeeOther)
 		return
 	}
 
-	_, err := db.Exec("INSERT INTO User (username, email) VALUES (?, ?)", username, email)
+	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	_, err := db.Exec("INSERT INTO User (username, email, password_hash) VALUES (?, ?, ?)",
+		username, email, string(hash))
 	if err != nil {
 		http.Redirect(w, r, "/?tab=manage&msg=Error:+"+template.URLQueryEscaper(err.Error())+"&msg_type=error", http.StatusSeeOther)
 		return
@@ -738,6 +937,169 @@ func updateReviewHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ==========================
+// Auth Handlers
+// ==========================
+
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if getCurrentUser(r) != nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		var flash *FlashMessage
+		if msg := r.URL.Query().Get("msg"); msg != "" {
+			msgType := r.URL.Query().Get("msg_type")
+			if msgType == "" {
+				msgType = "error"
+			}
+			flash = &FlashMessage{Type: msgType, Message: msg}
+		}
+		tmpl, _ := template.New("login").Parse(loginHTML)
+		tmpl.Execute(w, map[string]interface{}{"Flash": flash})
+		return
+	}
+
+	r.ParseForm()
+	username := strings.TrimSpace(r.FormValue("username"))
+	password := r.FormValue("password")
+
+	var user User
+	var createdAt time.Time
+	err := db.QueryRow(
+		"SELECT user_id, username, email, password_hash, is_admin, created_at FROM User WHERE username = ?",
+		username,
+	).Scan(&user.UserID, &user.Username, &user.Email, &user.PasswordHash, &user.IsAdmin, &createdAt)
+	if err != nil {
+		http.Redirect(w, r, "/login?msg=Invalid+username+or+password&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
+	if err != nil {
+		http.Redirect(w, r, "/login?msg=Invalid+username+or+password&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	db.Exec("UPDATE User SET last_login = NOW() WHERE user_id = ?", user.UserID)
+
+	session, _ := store.Get(r, "weekly-watch-session")
+	session.Values["user_id"] = user.UserID
+	session.Save(r, w)
+
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func signupHandler(w http.ResponseWriter, r *http.Request) {
+	if getCurrentUser(r) != nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		var flash *FlashMessage
+		if msg := r.URL.Query().Get("msg"); msg != "" {
+			msgType := r.URL.Query().Get("msg_type")
+			if msgType == "" {
+				msgType = "error"
+			}
+			flash = &FlashMessage{Type: msgType, Message: msg}
+		}
+		tmpl, _ := template.New("signup").Parse(signupHTML)
+		tmpl.Execute(w, map[string]interface{}{"Flash": flash})
+		return
+	}
+
+	r.ParseForm()
+	username := strings.TrimSpace(r.FormValue("username"))
+	email := strings.TrimSpace(r.FormValue("email"))
+	password := r.FormValue("password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	if username == "" || email == "" || password == "" {
+		http.Redirect(w, r, "/signup?msg=All+fields+are+required&msg_type=error", http.StatusSeeOther)
+		return
+	}
+	if len(password) < 6 {
+		http.Redirect(w, r, "/signup?msg=Password+must+be+at+least+6+characters&msg_type=error", http.StatusSeeOther)
+		return
+	}
+	if password != confirmPassword {
+		http.Redirect(w, r, "/signup?msg=Passwords+do+not+match&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		http.Redirect(w, r, "/signup?msg=Error+creating+account&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	_, err = db.Exec("INSERT INTO User (username, email, password_hash) VALUES (?, ?, ?)",
+		username, email, string(hash))
+	if err != nil {
+		if strings.Contains(err.Error(), "Duplicate") {
+			http.Redirect(w, r, "/signup?msg=Username+or+email+already+exists&msg_type=error", http.StatusSeeOther)
+		} else {
+			http.Redirect(w, r, "/signup?msg=Error:+"+template.URLQueryEscaper(err.Error())+"&msg_type=error", http.StatusSeeOther)
+		}
+		return
+	}
+
+	http.Redirect(w, r, "/login?msg=Account+created+successfully.+Please+log+in.&msg_type=success", http.StatusSeeOther)
+}
+
+func logoutHandler(w http.ResponseWriter, r *http.Request) {
+	session, _ := store.Get(r, "weekly-watch-session")
+	session.Values["user_id"] = nil
+	session.Options.MaxAge = -1
+	session.Save(r, w)
+	http.Redirect(w, r, "/login?msg=Logged+out+successfully&msg_type=success", http.StatusSeeOther)
+}
+
+func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
+	user := getCurrentUser(r)
+	if user == nil {
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/?tab=dashboard", http.StatusSeeOther)
+		return
+	}
+
+	r.ParseForm()
+	currentPassword := r.FormValue("current_password")
+	newPassword := r.FormValue("new_password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword))
+	if err != nil {
+		http.Redirect(w, r, "/?tab=dashboard&msg=Current+password+is+incorrect&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	if len(newPassword) < 6 {
+		http.Redirect(w, r, "/?tab=dashboard&msg=New+password+must+be+at+least+6+characters&msg_type=error", http.StatusSeeOther)
+		return
+	}
+	if newPassword != confirmPassword {
+		http.Redirect(w, r, "/?tab=dashboard&msg=New+passwords+do+not+match&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	hash, _ := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	_, err = db.Exec("UPDATE User SET password_hash = ? WHERE user_id = ?", string(hash), user.UserID)
+	if err != nil {
+		http.Redirect(w, r, "/?tab=dashboard&msg=Error+updating+password&msg_type=error", http.StatusSeeOther)
+		return
+	}
+
+	http.Redirect(w, r, "/?tab=dashboard&msg=Password+changed+successfully&msg_type=success", http.StatusSeeOther)
+}
+
+// ==========================
 // HTML Template
 // ==========================
 
@@ -904,9 +1266,18 @@ const indexHTML = `<!DOCTYPE html>
 <body>
     <div class="header">
         <h1>The Weekly Watch</h1>
-        {{if .Connected}}
-            <span class="connection-badge">Connected to MySQL</span>
-        {{end}}
+        <div style="display:flex;align-items:center;gap:16px;">
+            {{if .Connected}}
+                <span class="connection-badge">Connected to MySQL</span>
+            {{end}}
+            {{if .LoggedInUser}}
+                <span style="color:#c0c0d0;font-size:14px;">
+                    {{.LoggedInUser.Username}}
+                    {{if .IsAdmin}}<span style="color:#ffd166;font-size:11px;margin-left:4px;">(admin)</span>{{end}}
+                </span>
+                <a href="/logout" style="color:#e94560;font-size:13px;text-decoration:none;font-weight:600;">Logout</a>
+            {{end}}
+        </div>
     </div>
 
     <div class="container">
@@ -925,7 +1296,8 @@ const indexHTML = `<!DOCTYPE html>
             <strong>Status:</strong> Successfully Connected
         </div>
 
-        <!-- USER SELECTOR -->
+        <!-- USER SELECTOR (admin only) -->
+        {{if .IsAdmin}}
         <div class="section">
             <h2>Select a User</h2>
             <div class="user-select">
@@ -937,15 +1309,20 @@ const indexHTML = `<!DOCTYPE html>
                 {{end}}
             </div>
         </div>
+        {{end}}
 
         <!-- TAB NAVIGATION -->
         <div class="tab-nav">
             <a class="tab-link {{if eq .ActiveTab "dashboard"}}active{{end}}"
                href="/?{{if .SelectedUser}}user_id={{.SelectedUser.UserID}}&{{end}}tab=dashboard">Dashboard</a>
+            {{if .IsAdmin}}
             <a class="tab-link {{if eq .ActiveTab "manage"}}active{{end}}"
                href="/?{{if .SelectedUser}}user_id={{.SelectedUser.UserID}}&{{end}}tab=manage">Manage Records</a>
+            {{end}}
             <a class="tab-link {{if eq .ActiveTab "browse"}}active{{end}}"
                href="/?{{if .SelectedUser}}user_id={{.SelectedUser.UserID}}&{{end}}tab=browse">Browse All</a>
+            <a class="tab-link {{if eq .ActiveTab "reports"}}active{{end}}"
+               href="/?tab=reports">Reports</a>
         </div>
 
         <!-- ==================== DASHBOARD TAB ==================== -->
@@ -1128,6 +1505,32 @@ const indexHTML = `<!DOCTYPE html>
                 {{else}}<p class="empty-state">No recommendations yet.</p>{{end}}
             </div>
 
+            <!-- Change Password (only for own account) -->
+            {{if .LoggedInUser}}{{if eq .SelectedUser.UserID .LoggedInUser.UserID}}
+            <div class="section">
+                <h2>Change Password</h2>
+                <div class="form-card">
+                    <form action="/change-password" method="POST">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Current Password</label>
+                                <input type="password" name="current_password" required>
+                            </div>
+                            <div class="form-group">
+                                <label>New Password</label>
+                                <input type="password" name="new_password" required minlength="6">
+                            </div>
+                            <div class="form-group">
+                                <label>Confirm New Password</label>
+                                <input type="password" name="confirm_password" required minlength="6">
+                            </div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">Change Password</button>
+                    </form>
+                </div>
+            </div>
+            {{end}}{{end}}
+
             {{else}}
             <div class="empty-state" style="padding: 60px 20px;">
                 <p style="font-size: 18px; color: #8888aa;">Select a user above to view their dashboard.</p>
@@ -1135,7 +1538,8 @@ const indexHTML = `<!DOCTYPE html>
             {{end}}
         </div>
 
-        <!-- ==================== MANAGE TAB ==================== -->
+        <!-- ==================== MANAGE TAB (admin only) ==================== -->
+        {{if .IsAdmin}}
         <div class="tab-content {{if eq .ActiveTab "manage"}}active{{end}}">
 
             <div class="form-card">
@@ -1176,7 +1580,7 @@ const indexHTML = `<!DOCTYPE html>
             </div>
 
             <div class="form-card">
-                <h3>Register New User</h3>
+                <h3>Register New User (Admin)</h3>
                 <form action="/insert/user" method="POST">
                     <div class="form-row">
                         <div class="form-group">
@@ -1186,6 +1590,10 @@ const indexHTML = `<!DOCTYPE html>
                         <div class="form-group">
                             <label>Email *</label>
                             <input type="email" name="email" required placeholder="e.g. john@example.com">
+                        </div>
+                        <div class="form-group">
+                            <label>Password *</label>
+                            <input type="password" name="password" required placeholder="Min 6 characters" minlength="6">
                         </div>
                     </div>
                     <button type="submit" class="btn btn-primary">Register User</button>
@@ -1259,6 +1667,7 @@ const indexHTML = `<!DOCTYPE html>
                 </table>
             </div>
         </div>
+        {{end}}
 
         <!-- ==================== BROWSE TAB ==================== -->
         <div class="tab-content {{if eq .ActiveTab "browse"}}active{{end}}">
@@ -1276,6 +1685,7 @@ const indexHTML = `<!DOCTYPE html>
                 </table>
             </div>
 
+            {{if .IsAdmin}}
             <div class="section">
                 <h2>Registered Users</h2>
                 <table>
@@ -1289,6 +1699,52 @@ const indexHTML = `<!DOCTYPE html>
                     </tr>
                     {{end}}
                 </table>
+            </div>
+            {{end}}
+        </div>
+
+        <!-- ==================== REPORTS TAB ==================== -->
+        <div class="tab-content {{if eq .ActiveTab "reports"}}active{{end}}">
+            <div class="section">
+                <h2>Most Popular Movies</h2>
+                <p style="color:#8888aa;font-size:13px;margin-bottom:12px;">
+                    Movies ranked by total ratings received (uses JOIN on Rating + Movie, GROUP BY movie, COUNT/SUM aggregates).
+                </p>
+                {{if .PopularMovies}}
+                <table>
+                    <tr><th>#</th><th>Movie</th><th>Total Ratings</th><th>Loved</th><th>Liked</th></tr>
+                    {{range $i, $m := .PopularMovies}}
+                    <tr>
+                        <td>{{add $i 1}}</td>
+                        <td><strong>{{$m.Title}}</strong></td>
+                        <td>{{$m.RatingCount}}</td>
+                        <td><span class="status-badge status-loved">{{$m.LovedCount}}</span></td>
+                        <td><span class="status-badge status-liked">{{$m.LikedCount}}</span></td>
+                    </tr>
+                    {{end}}
+                </table>
+                {{else}}<p class="empty-state">No rating data available.</p>{{end}}
+            </div>
+
+            <div class="section">
+                <h2>User Activity Summary</h2>
+                <p style="color:#8888aa;font-size:13px;margin-bottom:12px;">
+                    Activity breakdown per user (uses LEFT JOIN with subqueries on Viewing_History, Review, and Rating tables with GROUP BY and COUNT/SUM aggregates).
+                </p>
+                {{if .UserActivities}}
+                <table>
+                    <tr><th>User</th><th>Movies Watched</th><th>Total Views (incl. rewatches)</th><th>Reviews Written</th><th>Ratings Given</th></tr>
+                    {{range .UserActivities}}
+                    <tr>
+                        <td>{{.Username}}</td>
+                        <td>{{.WatchCount}}</td>
+                        <td>{{.TotalRewatches}}</td>
+                        <td>{{.ReviewCount}}</td>
+                        <td>{{.RatingCount}}</td>
+                    </tr>
+                    {{end}}
+                </table>
+                {{else}}<p class="empty-state">No activity data available.</p>{{end}}
             </div>
         </div>
     </div>
@@ -1305,13 +1761,165 @@ const indexHTML = `<!DOCTYPE html>
 </html>`
 
 // ==========================
+// Login Template
+// ==========================
+
+const loginHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - The Weekly Watch</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f; color: #e0e0e0; min-height: 100vh;
+            display: flex; justify-content: center; align-items: center;
+        }
+        .login-card {
+            background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
+            padding: 40px; width: 100%; max-width: 420px;
+        }
+        .login-card h1 { color: #e94560; text-align: center; margin-bottom: 8px; font-size: 28px; }
+        .login-card .subtitle { color: #8888aa; text-align: center; margin-bottom: 24px; font-size: 14px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; font-size: 12px; color: #8888aa; margin-bottom: 4px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .form-group input {
+            width: 100%; background: #0f0f0f; border: 1px solid #3a3a5a;
+            color: #e0e0e0; padding: 10px 12px; border-radius: 6px; font-size: 14px;
+        }
+        .form-group input:focus { outline: none; border-color: #e94560; }
+        .btn-primary {
+            width: 100%; padding: 12px; background: #e94560; color: white;
+            border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer;
+            margin-top: 8px;
+        }
+        .btn-primary:hover { background: #d63851; }
+        .flash { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; }
+        .flash-error { background: #4a1520; color: #f4978e; border: 1px solid #6b2030; }
+        .flash-success { background: #1b4332; color: #95d5b2; border: 1px solid #2d6a4f; }
+        .link-row { text-align: center; margin-top: 16px; font-size: 14px; color: #8888aa; }
+        .link-row a { color: #e94560; text-decoration: none; }
+        .link-row a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>The Weekly Watch</h1>
+        <p class="subtitle">Sign in to your account</p>
+        {{if .Flash}}
+            <div class="flash flash-{{.Flash.Type}}">{{.Flash.Message}}</div>
+        {{end}}
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required autofocus placeholder="Enter your username">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required placeholder="Enter your password">
+            </div>
+            <button type="submit" class="btn-primary">Sign In</button>
+        </form>
+        <div class="link-row">
+            Don&#39;t have an account? <a href="/signup">Sign up</a>
+        </div>
+    </div>
+</body>
+</html>`
+
+// ==========================
+// Signup Template
+// ==========================
+
+const signupHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign Up - The Weekly Watch</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f; color: #e0e0e0; min-height: 100vh;
+            display: flex; justify-content: center; align-items: center;
+        }
+        .signup-card {
+            background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px;
+            padding: 40px; width: 100%; max-width: 420px;
+        }
+        .signup-card h1 { color: #e94560; text-align: center; margin-bottom: 8px; font-size: 28px; }
+        .signup-card .subtitle { color: #8888aa; text-align: center; margin-bottom: 24px; font-size: 14px; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; font-size: 12px; color: #8888aa; margin-bottom: 4px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .form-group input {
+            width: 100%; background: #0f0f0f; border: 1px solid #3a3a5a;
+            color: #e0e0e0; padding: 10px 12px; border-radius: 6px; font-size: 14px;
+        }
+        .form-group input:focus { outline: none; border-color: #e94560; }
+        .btn-primary {
+            width: 100%; padding: 12px; background: #e94560; color: white;
+            border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer;
+            margin-top: 8px;
+        }
+        .btn-primary:hover { background: #d63851; }
+        .flash { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; }
+        .flash-error { background: #4a1520; color: #f4978e; border: 1px solid #6b2030; }
+        .flash-success { background: #1b4332; color: #95d5b2; border: 1px solid #2d6a4f; }
+        .link-row { text-align: center; margin-top: 16px; font-size: 14px; color: #8888aa; }
+        .link-row a { color: #e94560; text-decoration: none; }
+        .link-row a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="signup-card">
+        <h1>The Weekly Watch</h1>
+        <p class="subtitle">Create a new account</p>
+        {{if .Flash}}
+            <div class="flash flash-{{.Flash.Type}}">{{.Flash.Message}}</div>
+        {{end}}
+        <form method="POST" action="/signup">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required autofocus placeholder="Choose a username">
+            </div>
+            <div class="form-group">
+                <label>Email</label>
+                <input type="email" name="email" required placeholder="Enter your email">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required placeholder="Min 6 characters" minlength="6">
+            </div>
+            <div class="form-group">
+                <label>Confirm Password</label>
+                <input type="password" name="confirm_password" required placeholder="Confirm your password" minlength="6">
+            </div>
+            <button type="submit" class="btn-primary">Create Account</button>
+        </form>
+        <div class="link-row">
+            Already have an account? <a href="/login">Sign in</a>
+        </div>
+    </div>
+</body>
+</html>`
+
+// ==========================
 // Main
 // ==========================
 
 func main() {
 	fmt.Println("===========================================")
 	fmt.Println("  The Weekly Watch - Movie Recommendation  ")
-	fmt.Println("  CS 4604 Phase 5                         ")
+	fmt.Println("  CS 4604 Phase 6                         ")
 	fmt.Println("===========================================")
 	fmt.Println()
 
@@ -1341,27 +1949,31 @@ func main() {
 	fmt.Println("Starting web server on http://localhost:8080")
 	fmt.Println("Press Ctrl+C to stop.")
 
-	// Page routes
-	http.HandleFunc("/", homeHandler)
+	// Public routes (no auth required)
+	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/signup", signupHandler)
+	http.HandleFunc("/logout", logoutHandler)
 	http.HandleFunc("/api/status", apiStatusHandler)
 
-	// INSERT routes
-	http.HandleFunc("/insert/movie", insertMovieHandler)
-	http.HandleFunc("/insert/user", insertUserHandler)
-	http.HandleFunc("/insert/rating", insertRatingHandler)
-	http.HandleFunc("/insert/review", insertReviewHandler)
+	// Auth-required routes
+	http.HandleFunc("/", requireAuth(homeHandler))
+	http.HandleFunc("/change-password", requireAuth(changePasswordHandler))
 
-	// DELETE routes
-	http.HandleFunc("/delete/movie", deleteMovieHandler)
-	http.HandleFunc("/delete/user", deleteUserHandler)
-	http.HandleFunc("/delete/rating", deleteRatingHandler)
-	http.HandleFunc("/delete/review", deleteReviewHandler)
+	// User data routes (auth required)
+	http.HandleFunc("/insert/rating", requireAuth(insertRatingHandler))
+	http.HandleFunc("/insert/review", requireAuth(insertReviewHandler))
+	http.HandleFunc("/delete/rating", requireAuth(deleteRatingHandler))
+	http.HandleFunc("/delete/review", requireAuth(deleteReviewHandler))
+	http.HandleFunc("/update/rating", requireAuth(updateRatingHandler))
+	http.HandleFunc("/update/review", requireAuth(updateReviewHandler))
 
-	// UPDATE routes
-	http.HandleFunc("/update/movie", updateMovieHandler)
-	http.HandleFunc("/update/user", updateUserHandler)
-	http.HandleFunc("/update/rating", updateRatingHandler)
-	http.HandleFunc("/update/review", updateReviewHandler)
+	// Admin-only routes
+	http.HandleFunc("/insert/movie", requireAdmin(insertMovieHandler))
+	http.HandleFunc("/insert/user", requireAdmin(insertUserHandler))
+	http.HandleFunc("/delete/movie", requireAdmin(deleteMovieHandler))
+	http.HandleFunc("/delete/user", requireAdmin(deleteUserHandler))
+	http.HandleFunc("/update/movie", requireAdmin(updateMovieHandler))
+	http.HandleFunc("/update/user", requireAdmin(updateUserHandler))
 
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
