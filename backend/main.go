@@ -39,7 +39,7 @@ import (
 
 const (
 	dbUser = "root"            // Change to your MySQL username
-	dbPass = "Hansolo13!?!"    // Change to your MySQL password
+	dbPass = "SuperSecretPass!?!"    // Change to your MySQL password
 	dbHost = "127.0.0.1"
 	dbPort = "3306"
 	dbName = "weekly_watch"
